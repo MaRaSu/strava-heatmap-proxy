@@ -9,7 +9,7 @@ const Router = require("./router");
 const Env = {
   STRAVA_ID: globalThis.STRAVA_ID,
   STRAVA_SESSION: globalThis.STRAVA_SESSION,
-  TILE_CACHE_SECS: +TILE_CACHE_SECS || 0,
+  TILE_CACHE_SECS: +globalThis.TILE_CACHE_SECS || 0,
   ALLOWED_ORIGINS: (globalThis.ALLOWED_ORIGINS || "*").split(","),
 };
 
@@ -17,8 +17,23 @@ addEventListener("fetch", (event) => {
   event.respondWith(handleRequest(event));
 });
 
+// Non-browser clients (JOSM, GIS software, native apps) send no Origin header
+// and are not subject to CORS, so an absent Origin is always allowed through.
+function isOriginAllowed(origin) {
+  if (origin === null) return true;
+  if (Env.ALLOWED_ORIGINS.includes("*")) return true;
+  return Env.ALLOWED_ORIGINS.includes(origin);
+}
+
 async function handleRequest(event) {
   try {
+    // Checked before the cache lookup: the cache is keyed on URL alone, so a
+    // check further down would be skipped entirely on a cache hit.
+    const origin = event.request.headers.get("origin");
+    if (!isOriginAllowed(origin)) {
+      return new Response("Origin not allowed", { status: 403 });
+    }
+
     let response = await caches.default.match(event.request.url);
 
     if (!response) {
@@ -34,12 +49,23 @@ async function handleRequest(event) {
         response = new Response(response.body, response);
         response.headers.append(
           "Cache-Control",
-          `maxage=${Env.TILE_CACHE_SECS}`,
+          `max-age=${Env.TILE_CACHE_SECS}`,
         );
+        // Stored before CORS headers are attached, so the entry stays
+        // origin-agnostic and can be handed to any caller below.
         event.waitUntil(
           caches.default.put(event.request.url, response.clone()),
         );
       }
+    }
+
+    if (origin !== null) {
+      response = new Response(response.body, response);
+      response.headers.set(
+        "Access-Control-Allow-Origin",
+        Env.ALLOWED_ORIGINS.includes("*") ? "*" : origin,
+      );
+      response.headers.set("Vary", "Origin");
     }
 
     return response;
@@ -110,6 +136,26 @@ Additional Activity Types
 `);
 }
 
+// Assumed lifetime when Strava sends no usable expiry. Short enough to recover
+// quickly if the guess is wrong, long enough that we are not re-authenticating
+// constantly.
+const FALLBACK_EXPIRY_MS = 60 * 60 * 1000;
+
+// Anything below this is far too small to be a millisecond timestamp for a
+// present-day date, so it must be seconds.
+const SECONDS_EPOCH_CEILING = 1e12;
+
+// CloudFront expiry epochs are conventionally in seconds, but Date.now() is in
+// milliseconds. Comparing the two directly makes every cached entry look stale,
+// which turns the freshness check into a login on every single tile request.
+// Normalize to milliseconds, and fall back to a fixed lifetime if Strava gives
+// us nothing usable rather than treating it as permanently expired.
+function normalizeExpiry(raw, now) {
+  if (!Number.isFinite(raw) || raw <= 0) return now + FALLBACK_EXPIRY_MS;
+  const ms = raw < SECONDS_EPOCH_CEILING ? raw * 1000 : raw;
+  return ms > now ? ms : now + FALLBACK_EXPIRY_MS;
+}
+
 // Exchange our session cookie for fresh CloudFront credentials via /maps.
 async function refreshCloudFrontCookies() {
   const resp = await fetch("https://www.strava.com/maps", {
@@ -129,7 +175,7 @@ async function refreshCloudFrontCookies() {
   ];
 
   const cookies = {};
-  let expiry = 0;
+  let rawExpiry = NaN;
 
   for (const header of resp.headers.getAll("set-cookie")) {
     const match = header.match(/^([^=]+)=([^;]*)/);
@@ -139,7 +185,7 @@ async function refreshCloudFrontCookies() {
     if (value && cookieNames.includes(name)) {
       cookies[name] = value;
     } else if (name === "_strava_CloudFront-Expires" && value) {
-      expiry = parseInt(value, 10);
+      rawExpiry = parseInt(value, 10);
     }
   }
 
@@ -153,7 +199,7 @@ async function refreshCloudFrontCookies() {
     .map(([k, v]) => `${k}=${v}`)
     .join("; ");
 
-  return { cookies: cookieStr, expiry };
+  return { cookies: cookieStr, expiry: normalizeExpiry(rawExpiry, Date.now()) };
 }
 
 const KV_KEY = "strava_cloudfront_cookies";
@@ -162,33 +208,60 @@ const REFRESH_BUFFER_MS = 5 * 60 * 1000; // refresh 5 minutes before expiry
 // in-memory cache, persists across requests within an isolate
 let COOKIE_CACHE = null;
 
-// Get valid CloudFront cookies, refreshing if needed.
-async function getStravaCookies(event) {
+// Held while a refresh is running so concurrent requests join it instead of
+// each firing its own login at Strava. One map pan misses the cache on ~30
+// tiles at once, and 30 simultaneous logins is what gets an account flagged.
+// This only spans a single isolate, but that is where the pile-up happens.
+let REFRESH_IN_FLIGHT = null;
+
+function isFresh(entry, now) {
+  return Boolean(entry && entry.expiry > now + REFRESH_BUFFER_MS);
+}
+
+function refreshOnce(event) {
+  if (REFRESH_IN_FLIGHT) return REFRESH_IN_FLIGHT;
+
+  REFRESH_IN_FLIGHT = refreshCloudFrontCookies()
+    .then((fresh) => {
+      COOKIE_CACHE = fresh;
+      const ttlSecs = Math.max(
+        Math.floor((fresh.expiry - Date.now()) / 1000),
+        60,
+      );
+      event.waitUntil(
+        STRAVA_HEATMAP_PROXY_COOKIES.put(KV_KEY, JSON.stringify(fresh), {
+          expirationTtl: ttlSecs,
+        }),
+      );
+      return fresh;
+    })
+    .finally(() => {
+      REFRESH_IN_FLIGHT = null;
+    });
+
+  return REFRESH_IN_FLIGHT;
+}
+
+// Get valid CloudFront cookies, refreshing if needed. Pass force after Strava
+// has rejected the cookies we hold, to bypass both caches.
+async function getStravaCookies(event, force = false) {
   const now = Date.now();
 
-  if (COOKIE_CACHE && COOKIE_CACHE.expiry > now + REFRESH_BUFFER_MS) {
-    return COOKIE_CACHE.cookies;
+  if (!force) {
+    if (isFresh(COOKIE_CACHE, now)) return COOKIE_CACHE.cookies;
+
+    const fromKv = await STRAVA_HEATMAP_PROXY_COOKIES.get(KV_KEY, {
+      type: "json",
+    });
+
+    if (isFresh(fromKv, now)) {
+      COOKIE_CACHE = fromKv;
+      return COOKIE_CACHE.cookies;
+    }
   }
 
-  const fromKv = await STRAVA_HEATMAP_PROXY_COOKIES.get(KV_KEY, {
-    type: "json",
-  });
-
-  if (fromKv && fromKv.expiry && fromKv.expiry > now + REFRESH_BUFFER_MS) {
-    COOKIE_CACHE = fromKv;
-    return COOKIE_CACHE.cookies;
-  }
-
-  COOKIE_CACHE = await refreshCloudFrontCookies();
-
-  const ttlSecs = Math.max(Math.floor((COOKIE_CACHE.expiry - now) / 1000), 60);
-  event.waitUntil(
-    STRAVA_HEATMAP_PROXY_COOKIES.put(KV_KEY, JSON.stringify(COOKIE_CACHE), {
-      expirationTtl: ttlSecs,
-    }),
-  );
-
-  return COOKIE_CACHE.cookies;
+  const fresh = await refreshOnce(event);
+  return fresh.cookies;
 }
 
 const PERSONAL_MAP_URL =
@@ -219,13 +292,6 @@ async function handleTileProxyRequest(request, event) {
     );
   }
 
-  const origin = request.headers.get("origin");
-  if (!Env.ALLOWED_ORIGINS.includes("*")) {
-    if (origin !== null && !Env.ALLOWED_ORIGINS.includes(origin)) {
-      return new Response("Origin not allowed", { status: 403 });
-    }
-  }
-
   const [_, kind, color, activity, z, x, y, res] = match;
   const data = {
     strava_id: Env.STRAVA_ID,
@@ -243,17 +309,26 @@ async function handleTileProxyRequest(request, event) {
   // replace templated data in base URL
   const proxyUrl = baseUrl.replace(/\{(\w+)\}/g, (_, key) => data[key]);
 
-  const stravaCookies = await getStravaCookies(event);
+  let response = await fetchTile(proxyUrl, event, false);
 
-  const proxiedRequest = new Request(proxyUrl, {
-    method: "GET",
-    headers: new Headers({ Cookie: stravaCookies }),
-  });
+  // Strava can invalidate cookies before they expire — a logout, a password
+  // change, a policy update. Going on expiry alone would leave us serving 403s
+  // until the clock ran out, so treat a rejection as a reason to
+  // re-authenticate now and try the tile once more.
+  if (response.status === 403) {
+    response = await fetchTile(proxyUrl, event, true);
+  }
 
-  let response = await fetch(proxiedRequest);
-  response = new Response(await response.arrayBuffer(), response);
+  return new Response(await response.arrayBuffer(), response);
+}
 
-  response.headers.append("Access-Control-Allow-Origin", origin);
+async function fetchTile(proxyUrl, event, force) {
+  const stravaCookies = await getStravaCookies(event, force);
 
-  return response;
+  return fetch(
+    new Request(proxyUrl, {
+      method: "GET",
+      headers: new Headers({ Cookie: stravaCookies }),
+    }),
+  );
 }
