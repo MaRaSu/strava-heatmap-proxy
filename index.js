@@ -228,6 +228,11 @@ function refreshOnce(event) {
         Math.floor((fresh.expiry - Date.now()) / 1000),
         60,
       );
+      // Every line here is one login against Strava. Seeing these arrive per
+      // tile rather than per hour is the signal that something is wrong.
+      console.log(
+        `refreshed CloudFront cookies, valid ${Math.round(ttlSecs / 60)}m`,
+      );
       event.waitUntil(
         STRAVA_HEATMAP_PROXY_COOKIES.put(KV_KEY, JSON.stringify(fresh), {
           expirationTtl: ttlSecs,
