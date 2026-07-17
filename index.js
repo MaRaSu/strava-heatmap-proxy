@@ -34,7 +34,7 @@ async function handleRequest(event) {
         response = new Response(response.body, response);
         response.headers.append(
           "Cache-Control",
-          `maxage=${Env.TILE_CACHE_SECS}`,
+          `max-age=${Env.TILE_CACHE_SECS}`,
         );
         event.waitUntil(
           caches.default.put(event.request.url, response.clone()),
