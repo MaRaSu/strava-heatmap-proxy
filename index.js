@@ -314,26 +314,43 @@ async function handleTileProxyRequest(request, event) {
   // replace templated data in base URL
   const proxyUrl = baseUrl.replace(/\{(\w+)\}/g, (_, key) => data[key]);
 
-  let response = await fetchTile(proxyUrl, event, false);
+  let response = await fetchTile(proxyUrl, kind, event, false);
 
   // Strava can invalidate cookies before they expire — a logout, a password
   // change, a policy update. Going on expiry alone would leave us serving 403s
   // until the clock ran out, so treat a rejection as a reason to
   // re-authenticate now and try the tile once more.
+  //
+  // Only 403. A 401 from the personal host means STRAVA_SESSION itself was
+  // rejected, and minting new CloudFront cookies cannot fix that — the secret
+  // needs replacing by hand.
   if (response.status === 403) {
-    response = await fetchTile(proxyUrl, event, true);
+    response = await fetchTile(proxyUrl, kind, event, true);
   }
 
   return new Response(await response.arrayBuffer(), response);
 }
 
-async function fetchTile(proxyUrl, event, force) {
-  const stravaCookies = await getStravaCookies(event, force);
+// The personal heatmap is per-athlete, so its host has to know who is asking.
+// The CloudFront cookies are only an access grant and carry no identity, which
+// is what a 401 from that host means. Strava's own client sends
+// _strava4_session alongside them, so do the same — but only to the host that
+// needs it, since the global heatmap is identical for everyone and has no use
+// for our identity.
+function cookieHeaderFor(kind, cloudFrontCookies) {
+  if (kind !== "personal") return cloudFrontCookies;
+  return `${cloudFrontCookies}; _strava4_session=${Env.STRAVA_SESSION}`;
+}
+
+async function fetchTile(proxyUrl, kind, event, force) {
+  const cloudFrontCookies = await getStravaCookies(event, force);
 
   return fetch(
     new Request(proxyUrl, {
       method: "GET",
-      headers: new Headers({ Cookie: stravaCookies }),
+      headers: new Headers({
+        Cookie: cookieHeaderFor(kind, cloudFrontCookies),
+      }),
     }),
   );
 }
