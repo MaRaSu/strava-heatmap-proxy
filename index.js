@@ -11,7 +11,26 @@ const Env = {
   STRAVA_SESSION: globalThis.STRAVA_SESSION,
   TILE_CACHE_SECS: +globalThis.TILE_CACHE_SECS || 0,
   ALLOWED_ORIGINS: (globalThis.ALLOWED_ORIGINS || "*").split(","),
+  // Shared secret gating tile access. Undefined until the secret is set, which
+  // is why it goes through globalThis like the others — a bare reference would
+  // throw at startup before the secret exists.
+  PROXY_KEY: globalThis.PROXY_KEY,
 };
+
+// The Origin allowlist only constrains browsers; a shared key in the URL gates
+// every client, browser or not. This is the real access control — the origin
+// check below is now belt-and-suspenders. Undefined PROXY_KEY means the secret
+// was never set: fail closed rather than silently serve, since this proxy rides
+// on a real Strava account.
+function tileKeyError(url) {
+  if (!Env.PROXY_KEY) {
+    return new Response("Proxy key not configured", { status: 500 });
+  }
+  if (url.searchParams.get("key") !== Env.PROXY_KEY) {
+    return new Response("Forbidden", { status: 403 });
+  }
+  return null;
+}
 
 addEventListener("fetch", (event) => {
   event.respondWith(handleRequest(event));
@@ -27,6 +46,18 @@ function isOriginAllowed(origin) {
 
 async function handleRequest(event) {
   try {
+    const url = new URL(event.request.url);
+
+    // Gate tile routes on the shared key, before the cache lookup — the cache
+    // is keyed on URL alone, so a check further down would be skipped on a hit,
+    // letting an unauthenticated caller read cached tiles. The index route ("/")
+    // is left open: it only serves help text and is handy for a liveness check.
+    const isTile = /^\/(personal|global)\//.test(url.pathname);
+    if (isTile) {
+      const keyError = tileKeyError(url);
+      if (keyError) return keyError;
+    }
+
     // Checked before the cache lookup: the cache is keyed on URL alone, so a
     // check further down would be skipped entirely on a cache hit.
     const origin = event.request.headers.get("origin");
