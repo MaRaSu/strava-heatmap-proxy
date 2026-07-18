@@ -1,21 +1,31 @@
 # strava-heatmap-proxy
 
-This is a simple [Cloudflare Worker](https://workers.dev) allowing
-unauthenticated access to personal and global Strava heatmaps. If you want to
-use your personal Strava heatmap in Gaia or Locus, this will give you a URL that
-you can use for that.
+_A personal fork of [erik/strava-heatmap-proxy](https://github.com/erik/strava-heatmap-proxy),
+adding a shared-key access gate and cookie-refresh hardening. For personal use
+with your own Strava account._
+
+This is a simple [Cloudflare Worker](https://workers.dev) that gives map clients
+a plain tile URL for personal and global Strava heatmaps. It handles Strava's
+own authentication for you — exchanging your session cookie for the short-lived
+CloudFront credentials the tiles require — so apps like Gaia or Locus don't have
+to. The personal heatmap is only served to an authenticated Strava session (see
+the note below); the global heatmap works for any account.
 
 Note: you **will** need to be a Strava premium subscriber to use the personal
 heatmap, while the global heatmaps are available to all Strava accounts.
 Personal use only, please. Strava will ratelimit you.
+
+> **This fork gates tile access behind a `PROXY_KEY`.** Every tile request must
+> carry `?key=<your key>`, so the deployed URL isn't an open proxy on your
+> Strava account for anyone who finds the hostname. See [Secrets](#secrets).
 
 # Usage
 
 If you want to use these heatmaps as a tile layer in another app, here are the
 template URLs to use:
 
-- Personal: `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/personal/orange/all/{zoom}/{x}/{y}@2x.png`
-- Global: `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/global/orange/all/{zoom}/{x}/{y}@2x.png`
+- Personal: `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/personal/orange/all/{zoom}/{x}/{y}@2x.png?key=YOUR_PROXY_KEY`
+- Global: `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/global/orange/all/{zoom}/{x}/{y}@2x.png?key=YOUR_PROXY_KEY`
 
 Check `https://strava-heatmap-proxy.YOUR_NAMESPACE.workers.dev/` for full list
 of supported tile colors, activities, and sizes.
@@ -52,6 +62,12 @@ wrangler kv namespace create STRAVA_HEATMAP_PROXY_COOKIES
 
 echo "1234" | wrangler secret put STRAVA_ID
 echo "abc123..." | wrangler secret put STRAVA_SESSION
+
+# Tile access is gated by a shared key — without it the worker refuses every
+# tile request (fails closed). Generate one, note it (it goes in your tile
+# URLs as ?key=...), and set it as a secret.
+openssl rand -hex 32           # copy the output
+wrangler secret put PROXY_KEY  # paste it when prompted
 ```
 
 The worker will automatically exchange your session cookie for CloudFront
@@ -65,10 +81,11 @@ though.
 Check that everything's working by running `wrangler dev`.
 
 Here's an example tile URL with some data:
-[/global/mobileblue/all/11/351/817@2x.png](http://127.0.0.1:8787/global/mobileblue/all/11/351/817@2x.png)
-(Downtown Los Angeles)
+[/global/mobileblue/all/11/351/817@2x.png?key=YOUR_PROXY_KEY](http://127.0.0.1:8787/global/mobileblue/all/11/351/817@2x.png?key=YOUR_PROXY_KEY)
+(Downtown Los Angeles). Set `PROXY_KEY` in a local `.dev.vars` file so the gate
+lets the request through; without it the worker fails closed.
 
-When you're all set, use `wrangler publish` to bring the site live on
+When you're all set, use `wrangler deploy` to bring the site live on
 `strava-heatmap-proxy.YOUR-NAMESPACE.workers.dev`
 
 ## (optional) GitHub Actions
