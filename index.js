@@ -167,24 +167,18 @@ Additional Activity Types
 `);
 }
 
-// Assumed lifetime when Strava sends no usable expiry. Short enough to recover
-// quickly if the guess is wrong, long enough that we are not re-authenticating
-// constantly.
+// Assumed lifetime when Strava sends no usable expiry, so a missing value reads
+// as "good for a while" instead of "already expired" — the latter would drop
+// the cache and re-authenticate on every request.
 const FALLBACK_EXPIRY_MS = 60 * 60 * 1000;
 
-// Anything below this is far too small to be a millisecond timestamp for a
-// present-day date, so it must be seconds.
-const SECONDS_EPOCH_CEILING = 1e12;
-
-// CloudFront expiry epochs are conventionally in seconds, but Date.now() is in
-// milliseconds. Comparing the two directly makes every cached entry look stale,
-// which turns the freshness check into a login on every single tile request.
-// Normalize to milliseconds, and fall back to a fixed lifetime if Strava gives
-// us nothing usable rather than treating it as permanently expired.
-function normalizeExpiry(raw, now) {
-  if (!Number.isFinite(raw) || raw <= 0) return now + FALLBACK_EXPIRY_MS;
-  const ms = raw < SECONDS_EPOCH_CEILING ? raw * 1000 : raw;
-  return ms > now ? ms : now + FALLBACK_EXPIRY_MS;
+// _strava_CloudFront-Expires is a millisecond epoch (verified against live
+// values ~24h out), the same units as Date.now(), so it is used directly. Fall
+// back to a fixed lifetime only when it is missing, unparseable, or already
+// past.
+function normalizeExpiry(rawMs, now) {
+  if (!Number.isFinite(rawMs) || rawMs <= now) return now + FALLBACK_EXPIRY_MS;
+  return rawMs;
 }
 
 // Exchange our session cookie for fresh CloudFront credentials via /maps.
